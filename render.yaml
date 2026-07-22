@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: lead-scraper-auth
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: lead-scraper-db
+          property: connectionString
+
+databases:
+  - name: lead-scraper-db
+    plan: free
+    databaseName: lead_scraper
+    user: lead_scraper
