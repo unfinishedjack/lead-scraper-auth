@@ -38,7 +38,7 @@ import tempfile
 import time
 import psutil
 from datetime import datetime
-from login_dialog import require_login, consume_tokens, refresh_balance, fetch_settings
+from login_dialog import require_login, consume_tokens, refresh_balance, fetch_settings, logout
 
 import pandas as pd
 import phonenumbers
@@ -77,6 +77,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
 )
 
+from PyQt6.QtGui import QPalette, QColor
 from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------------------------
@@ -112,10 +113,10 @@ def _is_noise_email(email: str) -> bool:
 # ---------------------------------------------------------------------------
 # Token cost model — how many "weighted lead units" a single lead costs.
 # A lead with a found email is the most valuable (1 unit); a lead with only
-# a phone number is worth half that (0.5); a lead with neither is free (0),
-# since there's no way to contact the business from it at all. The admin
-# sets a leads_per_token ratio (e.g. 10) that converts these weighted units
-# into an actual token cost: token_cost = weighted_units / leads_per_token.
+# a phone number is worth half that (0.5); a lead with neither still costs
+# a small floor amount (0.2), since it can't be reasoned away as truly free.
+# The admin sets a leads_per_token ratio (e.g. 10) that converts these
+# weighted units into an actual token cost: token_cost = weighted_units / leads_per_token.
 # ---------------------------------------------------------------------------
 
 def lead_cost_units(row) -> float:
@@ -125,7 +126,7 @@ def lead_cost_units(row) -> float:
         return 1.0
     if phone:
         return 0.5
-    return 0.0
+    return 0.2
 
 
 def total_cost_units(df: pd.DataFrame) -> float:
@@ -506,7 +507,7 @@ class ScraperWorker(QThread):
         self._stop_requested = False
         self._chrome_process = None
         # Running tally of "weighted lead units" spent so far this run
-        # (email=1, phone-only=0.5, neither=free/0) — compared against
+        # (email=1, phone-only=0.5, neither=0.2) — compared against
         # cfg["token_budget_leads"] to auto-stop a user account that has
         # run out of tokens partway through. None/absent budget = no cap
         # (admin accounts, or a backend that couldn't be reached).
@@ -748,10 +749,13 @@ class ScraperWorker(QThread):
             all_results.extend(r)
 
             # Provisional running cost: email is never known yet at this
-            # stage, so each card is worth 0.5 (has a phone) or 0 (doesn't).
+            # stage, so each card is worth 0.5 (has a phone) or 0.2 (doesn't).
             # This lets a user's run stop itself as soon as it's clearly
             # burned through their balance, without waiting for enrichment.
-            delta = sum(0.5 for card in r if str(card.get("phone", "")).strip())
+            delta = sum(
+                0.5 if str(card.get("phone", "")).strip() else 0.2
+                for card in r
+            )
             self._add_units_and_maybe_stop(delta)
 
         if self.cfg["close_after_run"]:
@@ -799,7 +803,7 @@ class ScraperWorker(QThread):
                     # No Maps place-page fallback — if the card didn't expose
                     # a website link, skip this lead entirely rather than
                     # reopening Maps to look for one.
-                    prior_cost = 0.5 if str(card.get("phone", "")).strip() else 0.0
+                    prior_cost = 0.5 if str(card.get("phone", "")).strip() else 0.2
                     if website:
                         card["email"] = await get_email_from_website(
                             context, website, timeout_seconds
@@ -927,16 +931,39 @@ QGroupBox {
 }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
 
-QListWidget, QPlainTextEdit, QTableWidget, QLineEdit, QSpinBox, QComboBox {
+QListWidget, QPlainTextEdit, QTableWidget, QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #20242e; border: 1px solid #2f3542; border-radius: 6px;
     padding: 5px; selection-background-color: #3d6bff;
 }
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border: 1px solid #4c7cff; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #4c7cff; }
 
 QTableWidget { gridline-color: #2a2f3a; alternate-background-color: #1c2027; }
+QTableWidget::item { padding: 4px; }
+QTableWidget::item:selected { background-color: #3d6bff; color: #ffffff; }
+QTableWidget::item:hover { background-color: #232a3a; }
+
+QTableWidget::item {
+    padding: 4px;
+}
+QTableWidget::item:selected {
+    background-color: #3d6bff;
+    color: #ffffff;
+}
+QTableWidget::item:hover {
+    background-color: #232a3a;
+}
+
 QHeaderView::section {
     background-color: #232834; color: #b8bfcf; padding: 8px;
     border: none; border-bottom: 1px solid #2f3542; font-weight: 600;
+}
+QHeaderView {
+    background-color: #232834;
+}
+QTableCornerButton::section {
+    background-color: #232834;
+    border: none;
+    border-bottom: 1px solid #2f3542;
 }
 
 QPushButton {
@@ -966,6 +993,26 @@ QCheckBox::indicator { width: 16px; height: 16px; }
 QScrollBar:vertical { background: #181b22; width: 10px; margin: 0; }
 QScrollBar::handle:vertical { background: #34394a; border-radius: 5px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: #454b5e; }
+
+QMessageBox {
+    background-color: #181b22;
+}
+QMessageBox QLabel {
+    color: #e6e6e6;
+    background-color: transparent;
+}
+QMessageBox QPushButton {
+    background-color: #3d6bff;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-weight: 600;
+    min-width: 70px;
+}
+QMessageBox QPushButton:hover {
+    background-color: #5680ff;
+}
 """
 
 
@@ -1058,7 +1105,15 @@ class MainWindow(QMainWindow):
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.setObjectName("secondary")
         self.export_btn.clicked.connect(self.export_csv)
+        self.export_btn.setEnabled(False)
         toolbar.addWidget(self.export_btn)
+
+        toolbar.addSeparator()
+
+        self.logout_btn = QPushButton("Log Out")
+        self.logout_btn.setObjectName("secondary")
+        self.logout_btn.clicked.connect(self.handle_logout)
+        toolbar.addWidget(self.logout_btn)
 
     def _update_balance_label(self):
         if self.is_admin:
@@ -1156,14 +1211,38 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.results_count_label)
         right_layout.addLayout(header_row)
 
-        self.table = QTableWidget(0, len(COLUMNS))
-        self.table.setHorizontalHeaderLabels([c.replace("_", " ").title() for c in COLUMNS])
+        self.table = QTableWidget(0, len(COLUMNS) + 1)
+        self.table.setHorizontalHeaderLabels(["Keep"] + [c.replace("_", " ").title() for c in COLUMNS])
+        self.table.setColumnWidth(0, 50)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
+        pal = self.table.palette()
+        pal.setColor(QPalette.ColorRole.Base, QColor("#20242e"))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#1c2027"))
+        self.table.setPalette(pal)
+        self.table.itemChanged.connect(self._on_table_item_changed)
         right_layout.addWidget(self.table, stretch=1)
+
+        selection_row = QHBoxLayout()
+        self.selection_cost_label = QLabel("")
+        selection_row.addWidget(self.selection_cost_label)
+        selection_row.addStretch()
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.setObjectName("secondary")
+        select_all_btn.clicked.connect(lambda: self._set_all_checked(True))
+        select_none_btn = QPushButton("Select None")
+        select_none_btn.setObjectName("secondary")
+        select_none_btn.clicked.connect(lambda: self._set_all_checked(False))
+        self.confirm_selection_btn = QPushButton("✓  Confirm && Charge Selected")
+        self.confirm_selection_btn.clicked.connect(self.confirm_selection)
+        self.confirm_selection_btn.setEnabled(False)
+        selection_row.addWidget(select_all_btn)
+        selection_row.addWidget(select_none_btn)
+        selection_row.addWidget(self.confirm_selection_btn)
+        right_layout.addLayout(selection_row)
 
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
@@ -1326,7 +1405,7 @@ class MainWindow(QMainWindow):
             enrich_hint_text += (
                 f" Token cost: a lead with an email found costs 1 token per "
                 f"{self.leads_per_token:g}, a phone-only lead costs half that, "
-                f"and a lead with neither is free."
+                f"and a lead with neither still costs a small amount (0.2 units)."
             )
         enrich_hint = QLabel(enrich_hint_text)
         enrich_hint.setWordWrap(True)
@@ -1448,7 +1527,7 @@ class MainWindow(QMainWindow):
             f"Every scrape spends tokens based on what it actually finds:\n\n"
             f"•  A lead with an email found costs 1 token per {self.leads_per_token:g} leads\n"
             f"•  A lead with only a phone number costs half that\n"
-            f"•  A lead with neither a phone nor an email is completely free\n\n"
+            f"•  A lead with neither a phone nor an email still costs a small amount (0.2 units)\n\n"
             f"If your balance runs out partway through a run, the run stops "
             f"itself automatically and keeps whatever it already found."
         )
@@ -1637,6 +1716,10 @@ class MainWindow(QMainWindow):
         self.users_table.setHorizontalHeaderLabels(["Email", "Role", "Tokens Balance"])
         self.users_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.users_table.horizontalHeader().setStretchLastSection(True)
+        pal2 = self.users_table.palette()
+        pal2.setColor(QPalette.ColorRole.Base, QColor("#20242e"))
+        pal2.setColor(QPalette.ColorRole.AlternateBase, QColor("#1c2027"))
+        self.users_table.setPalette(pal2)
         users_layout.addWidget(self.users_table)
 
         outer.addWidget(users_group, stretch=1)
@@ -1885,32 +1968,30 @@ class MainWindow(QMainWindow):
     # -- Scrape control -----------------------------------------------------
 
     def start_scrape(self):
+        self.export_btn.setEnabled(False)
         cfg = self._gather_config_from_fields()
         if not cfg["queries"]:
             QMessageBox.warning(self, "No queries", "Add at least one search query first.")
             return
 
         # Token budget: admins are unlimited; users are capped at whatever
-        # their current balance converts to in weighted lead-units. Leads
-        # with neither a phone nor an email are free and never count
-        # against this, so a 0-balance user can still run — they'll just
-        # only ever keep the free ones once the budget check kicks in.
+        # their current balance converts to in weighted lead-units. Every
+        # lead now costs at least 0.2 units, so a 0-balance user's run will
+        # stop itself almost immediately, on the very first card found.
         if self.is_admin:
             cfg["token_budget_leads"] = None
         else:
             bal = self.session.get("tokens_balance", 0.0)
-            cfg["token_budget_leads"] = max(0.0, bal) * self.leads_per_token
             if bal <= 0:
-                proceed = QMessageBox.question(
+                QMessageBox.warning(
                     self, "No tokens left",
-                    "Your token balance is 0. The scrape can still run and "
-                    "will keep any leads with neither a phone nor an email "
-                    "(those are always free), but it will stop itself as "
-                    "soon as it would need to spend a token. Continue?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    "Your token balance is 0. Every lead costs at least a small "
+                    "amount now, so there's no way to run a scrape and keep "
+                    "anything from it. Buy more tokens from the Buy Tokens tab, "
+                    "or ask your admin to credit your account.",
                 )
-                if proceed != QMessageBox.StandardButton.Yes:
-                    return
+                return
+            cfg["token_budget_leads"] = bal * self.leads_per_token
 
         self.table.setRowCount(0)
         self.results_df = pd.DataFrame(columns=COLUMNS)
@@ -1964,58 +2045,29 @@ class MainWindow(QMainWindow):
         self.log_box.appendPlainText(text)
 
     def add_row(self, card: dict):
+        self.table.blockSignals(True)
         self.table.setSortingEnabled(False)
         row = self.table.rowCount()
         self.table.insertRow(row)
+        keep_item = QTableWidgetItem()
+        keep_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        keep_item.setCheckState(Qt.CheckState.Checked)
+        self.table.setItem(row, 0, keep_item)
         for col, key in enumerate(COLUMNS):
-            self.table.setItem(row, col, QTableWidgetItem(str(card.get(key, ""))))
-        # Clear any leftover header sort indicator (from a previous manual
-        # column click) before re-enabling — otherwise Qt silently re-sorts
-        # the table itself using its own indicator the instant sorting is
-        # turned back on, overriding the row order we just inserted.
+            self.table.setItem(row, col + 1, QTableWidgetItem(str(card.get(key, ""))))
         self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
         self.table.setSortingEnabled(True)
+        self.table.blockSignals(False)
         self.results_count_label.setText(f"{row + 1} leads (raw, before dedup)")
 
     def on_finished(self, df: pd.DataFrame):
         df = self._sort_df_if_needed(df)
         self.results_df = df
         self.repopulate_table(df)
-        self.results_count_label.setText(f"{len(df)} leads (deduped)")
-        self.statusBar().showMessage(f"Done — {len(df)} unique leads found.")
-
-        # Charge for what was actually found (admins are never charged —
-        # the backend also enforces this, this is just so the UI doesn't
-        # show a confusing deduction for an admin run).
-        if not self.is_admin and not df.empty:
-            units = total_cost_units(df)
-            token_cost = units / self.leads_per_token if self.leads_per_token else 0.0
-            new_balance = consume_tokens(self.session.get("token"), token_cost)
-            if new_balance is not None:
-                self.session["tokens_balance"] = new_balance
-                self._update_balance_label()
-                self.append_log(
-                    f"Charged {token_cost:.2f} tokens for this run "
-                    f"({units:g} weighted lead-units) — new balance {new_balance:g}."
-                )
-            else:
-                self.append_log(
-                    "Couldn't reach the server to charge tokens for this run — "
-                    "your on-screen balance may be stale."
-                )
-
-        base_path = self.output_path_edit.text().strip() or DEFAULT_CONFIG["output_path"]
-        stem, ext = os.path.splitext(base_path)
-        ext = ext or ".csv"
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        out_path = f"{stem}_{timestamp}{ext}"
-        try:
-            df.to_csv(out_path, index=False, encoding="utf-8-sig")
-            self.append_log(f"Auto-saved to {out_path}")
-            self.last_autosave_path = out_path
-        except Exception as e:
-            self.append_log(f"Could not auto-save CSV: {e}")
-
+        self.results_count_label.setText(f"{len(df)} leads (deduped) — select which to keep below")
+        self.statusBar().showMessage(f"Done — {len(df)} unique leads found. Review and confirm your selection.")
+        self.export_btn.setEnabled(False)   # ← add this
+        
     def on_failed(self, message):
         QMessageBox.critical(self, "Scrape failed", message)
         self.statusBar().showMessage("Failed.")
@@ -2025,20 +2077,113 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
 
     def repopulate_table(self, df: pd.DataFrame):
+        self.table.blockSignals(True)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         for _, row in df.iterrows():
             r = self.table.rowCount()
             self.table.insertRow(r)
+            keep_item = QTableWidgetItem()
+            keep_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            keep_item.setCheckState(Qt.CheckState.Checked)
+            self.table.setItem(r, 0, keep_item)
             for col, key in enumerate(COLUMNS):
-                self.table.setItem(r, col, QTableWidgetItem(str(row.get(key, ""))))
-        # Same reasoning as add_row(): drop the native header sort indicator
-        # so re-enabling sorting doesn't immediately re-order the rows we
-        # just placed (this is what makes the "sort alphabetically" checkbox
-        # actually stick instead of being silently overridden).
+                self.table.setItem(r, col + 1, QTableWidgetItem(str(row.get(key, ""))))
         self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
         self.table.setSortingEnabled(True)
+        self.table.blockSignals(False)
+        self._update_selection_summary()
 
+    def _get_checked_row_indices(self):
+        rows = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                rows.append(r)
+        return rows
+
+    def _set_all_checked(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self.table.blockSignals(True)
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item is not None:
+                item.setCheckState(state)
+        self.table.blockSignals(False)
+        self._update_selection_summary()
+
+    def _on_table_item_changed(self, item):
+        if item.column() == 0:
+            self._update_selection_summary()
+
+    def _update_selection_summary(self):
+        if self.results_df.empty:
+            self.selection_cost_label.setText("")
+            self.confirm_selection_btn.setEnabled(False)
+            return
+
+        checked_rows = self._get_checked_row_indices()
+        units = 0.0
+        for r in checked_rows:
+            row_dict = {key: self.table.item(r, col + 1).text() for col, key in enumerate(COLUMNS)}
+            units += lead_cost_units(row_dict)
+
+        if self.is_admin:
+            self.selection_cost_label.setText(f"{len(checked_rows)} leads selected (admin — free)")
+            self.selection_cost_label.setStyleSheet("color: #4c7cff; font-weight: 600;")
+            self.confirm_selection_btn.setEnabled(len(checked_rows) > 0)
+        else:
+            cost = units / self.leads_per_token if self.leads_per_token else 0.0
+            bal = self.session.get("tokens_balance", 0.0)
+            over = cost > bal
+            color = "#e5484d" if over else "#4c7cff"
+            self.selection_cost_label.setText(
+                f"{len(checked_rows)} leads selected — costs {cost:.2f} tokens (balance: {bal:g})"
+            )
+            self.selection_cost_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+            self.confirm_selection_btn.setEnabled(len(checked_rows) > 0 and not over)
+
+    def confirm_selection(self):
+        checked_rows = self._get_checked_row_indices()
+        if not checked_rows:
+            QMessageBox.information(self, "Nothing selected", "Check at least one lead to keep.")
+            return
+
+        kept_df = self.results_df.iloc[checked_rows].reset_index(drop=True)
+        units = total_cost_units(kept_df)
+
+        if not self.is_admin:
+            token_cost = units / self.leads_per_token if self.leads_per_token else 0.0
+            bal = self.session.get("tokens_balance", 0.0)
+            if token_cost > bal:
+                QMessageBox.warning(
+                    self, "Not enough tokens",
+                    f"Selected leads cost {token_cost:.2f} tokens but you only have "
+                    f"{bal:g}. Uncheck some leads or buy more tokens.",
+                )
+                return
+            new_balance = consume_tokens(self.session.get("token"), token_cost)
+            if new_balance is not None:
+                self.session["tokens_balance"] = new_balance
+                self._update_balance_label()
+                self.append_log(
+                    f"Charged {token_cost:.2f} tokens for {len(kept_df)} selected leads "
+                    f"({units:g} weighted lead-units) — new balance {new_balance:g}."
+                )
+            else:
+                self.append_log(
+                    "Couldn't reach the server to charge tokens for this selection — "
+                    "your on-screen balance may be stale."
+                )
+
+        # dedented — now runs for admins too
+        self.results_df = kept_df
+        self.repopulate_table(kept_df)
+        self.results_count_label.setText(f"{len(kept_df)} leads kept")
+        self.confirm_selection_btn.setEnabled(False)
+        self.export_btn.setEnabled(True)
+
+        self.statusBar().showMessage(f"Kept {len(kept_df)} leads. Use Export CSV to save them.")
     # -- Export ---------------------------------------------------------------
 
     def export_csv(self):
@@ -2064,18 +2209,42 @@ class MainWindow(QMainWindow):
             pass
         event.accept()
 
+    def handle_logout(self):
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.warning(self, "Scrape in progress",
+                                 "Stop the current scrape before logging out.")
+            return
+        confirm = QMessageBox.question(
+            self, "Log out",
+            "Log out of this account? You'll need to sign in again to use the app.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        logout()
+        QApplication.instance().exit(RESTART_CODE)
+
+RESTART_CODE = 1000
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    session = require_login(app)
-    if session is None:
-        sys.exit(0)  # user closed the login dialog without logging in
+    while True:
+        session = require_login(app)
+        if session is None:
+            sys.exit(0)
 
-    window = MainWindow(session)
-    window.show()
-    sys.exit(app.exec())
+        window = MainWindow(session)
+        window.show()
+        exit_code = app.exec()
+
+        window.close()  # <-- add this line
+
+        if exit_code != RESTART_CODE:
+            sys.exit(exit_code)
+        # else: loop back and show the login dialog again, same QApplication
 
 if __name__ == "__main__":
     main()
+

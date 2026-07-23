@@ -116,6 +116,10 @@ def _clear_token():
     if os.path.exists(TOKEN_PATH):
         os.remove(TOKEN_PATH)
 
+def logout():
+    """Clears the locally saved session so the next launch (or a live
+    logout) requires signing in again."""
+    _clear_token()
 
 def fetch_me(access_token: str):
     """Hits /me with the given token. Returns a dict with email/role/
