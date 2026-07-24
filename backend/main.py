@@ -456,8 +456,6 @@ def health():
 
 @app.post("/signup/request-otp", status_code=status.HTTP_200_OK)
 def signup_request_otp(req: RequestOtpRequest, db: Session = Depends(get_db)):
-    """Step 1 of signup: validate + stash the (hashed) password and email
-    an OTP. No User row is created yet."""
     if len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
@@ -478,13 +476,11 @@ def signup_request_otp(req: RequestOtpRequest, db: Session = Depends(get_db)):
 
     sent = send_otp_email(email, code)
     if not sent:
-        # Don't leak whether email delivery succeeded to an unauthenticated
-        # caller in detail, but do surface a generic failure so the GUI can
-        # tell the user to retry rather than silently hang.
-        raise HTTPException(status_code=502, detail="Couldn't send the verification email — try again shortly")
+        # DEV/TEST ONLY — remove before real users sign up.
+        print(f"[DEV] OTP for {email}: {code}")
+        return {"detail": f"(DEV) Email not configured — your code is {code}"}
 
     return {"detail": f"Verification code sent to {email}"}
-
 
 @app.post("/signup/verify-otp", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 def signup_verify_otp(req: VerifyOtpRequest, db: Session = Depends(get_db)):
