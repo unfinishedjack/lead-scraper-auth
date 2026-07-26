@@ -47,6 +47,8 @@ import smtplib
 import ssl
 from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 
 import bcrypt
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -139,6 +141,50 @@ def send_email(to_addrs: list[str], subject: str, body_html: str) -> bool:
         msg["Subject"] = subject
         msg["From"] = GMAIL_ADDRESS
         msg["To"] = ", ".join(to_addrs)
+        context = ssl.create_default_context()
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls(context=context)
+            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            server.sendmail(GMAIL_ADDRESS, to_addrs, msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[email] send failed: {e!r}")
+        return False
+
+
+def send_email_with_inline_image(
+    to_addrs: list[str],
+    subject: str,
+    body_html: str,
+    image_bytes: bytes | None = None,
+    image_mime: str = "image/png",
+    cid: str = "paymentproof",
+) -> bool:
+    """Like send_email(), but attaches image_bytes as a real inline MIME
+    image part referenced via cid: in body_html, instead of embedding it
+    as a base64 data: URI. Gmail (and most clients) strip/refuse to render
+    data: URIs in HTML mail, and a single unwrapped base64 line can also
+    exceed SMTP's 998-char line limit and get mangled in transit — cid:
+    attachments avoid both problems."""
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        print(f"[email] GMAIL_ADDRESS/GMAIL_APP_PASSWORD not set — skipping send: {subject!r}")
+        return False
+    if not to_addrs:
+        return False
+    try:
+        msg = MIMEMultipart("related")
+        msg["Subject"] = subject
+        msg["From"] = GMAIL_ADDRESS
+        msg["To"] = ", ".join(to_addrs)
+        msg.attach(MIMEText(body_html, "html"))
+
+        if image_bytes is not None:
+            subtype = image_mime.split("/")[-1] or "png"
+            img = MIMEImage(image_bytes, _subtype=subtype)
+            img.add_header("Content-ID", f"<{cid}>")
+            img.add_header("Content-Disposition", "inline", filename=f"proof.{subtype}")
+            msg.attach(img)
+
         context = ssl.create_default_context()
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls(context=context)
@@ -747,13 +793,25 @@ def create_payment_submission(
 
     approve_url = f"{APP_BASE_URL}/admin/email-action?token={create_email_action_token(sub.id, 'approve')}"
     decline_url = f"{APP_BASE_URL}/admin/email-action?token={create_email_action_token(sub.id, 'decline')}"
-    send_email(
+
+    note_html = f"<p>Note: {sub.note}</p>" if sub.note else ""
+    # Reference the screenshot via cid: — it's attached as a real inline
+    # MIME image part by send_email_with_inline_image() below, not embedded
+    # as a base64 data: URI (Gmail/most clients strip those, and long
+    # unwrapped base64 lines can get mangled by SMTP's line-length limit).
+    image_html = (
+        f"<p><img src='cid:paymentproof' "
+        f"style='max-width:360px;border-radius:8px;border:1px solid #ddd;' /></p>"
+    )
+
+    send_email_with_inline_image(
         list(ADMIN_NOTIFY_EMAILS),
         subject=f"New payment proof from {user.email} ({req.tokens_requested:g} tokens)",
         body_html=(
             f"<p><b>{user.email}</b> submitted proof of payment for "
             f"<b>{req.tokens_requested:g} tokens</b>.</p>"
-            f"<p>Note: {req.note or '(none)'}</p>"
+            f"{note_html}"
+            f"{image_html}"
             f"<p>"
             f"<a href='{approve_url}' style='background:#3d6bff;color:white;"
             f"padding:8px 16px;border-radius:6px;text-decoration:none;'>Approve</a>"
@@ -765,6 +823,8 @@ def create_payment_submission(
             f"(submission #{sub.id}). Approving here credits exactly the requested amount; "
             f"use the app if you need to grant a different amount.</p>"
         ),
+        image_bytes=base64.b64decode(sub.image_data),
+        image_mime=sub.image_mime,
     )
 
     return PaymentSubmissionResponse(
@@ -916,7 +976,7 @@ def admin_email_action(token: str = Query(...), db: Session = Depends(get_db)):
             f"{f' by {sub.reviewed_by}' if sub.reviewed_by else ''}.</p>"
         )
 
-    user = _apply_review(db, sub, action, None, "email-link", "email-link")
+    user = _apply_review(db, sub, action, None, None, "email-link")
     if action == "approve":
         new_balance = user.tokens_balance if user else None
         return HTMLResponse(

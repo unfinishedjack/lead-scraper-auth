@@ -38,12 +38,17 @@ import tempfile
 import time
 import psutil
 from datetime import datetime
-from login_dialog import require_login, consume_tokens, refresh_balance, fetch_settings, logout
+from login_dialog import (
+    require_login, consume_tokens, refresh_balance, fetch_settings, logout,
+    submit_payment_proof, get_my_payment_submissions,
+    admin_get_payment_submissions, admin_get_payment_submission_image,
+    admin_review_payment_submission,
+)
 
 import pandas as pd
 import phonenumbers
 import requests
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -75,6 +80,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QDoubleSpinBox,
+    QScrollArea,
 )
 
 from PyQt6.QtGui import QPalette, QColor
@@ -505,6 +511,7 @@ class ScraperWorker(QThread):
         super().__init__()
         self.cfg = dict(config)
         self._stop_requested = False
+        self._manual_stop_requested = False
         self._chrome_process = None
         # Running tally of "weighted lead units" spent so far this run
         # (email=1, phone-only=0.5, neither=0.2) — compared against
@@ -515,20 +522,30 @@ class ScraperWorker(QThread):
 
     def request_stop(self):
         self._stop_requested = True
+        self._manual_stop_requested = True
 
-    def _add_units_and_maybe_stop(self, delta: float):
+    def _add_units_and_maybe_stop(self, delta: float, enforce: bool = True):
         if delta <= 0:
             self._spent_units += delta
             return
         self._spent_units += delta
         budget = self.cfg.get("token_budget_leads")
         if budget is not None and self._spent_units >= budget and not self._stop_requested:
-            self._stop_requested = True
-            self.log.emit(
-                f"Token balance exhausted (used ~{self._spent_units:.1f}/"
-                f"{budget:.1f} weighted leads) — stopping the run. "
-                f"Leads found so far are kept."
-            )
+            if enforce:
+                self._stop_requested = True
+                self.log.emit(
+                    f"Token balance exhausted (used ~{self._spent_units:.1f}/"
+                    f"{budget:.1f} lead credits) — stopping the run. "
+                    f"Leads found so far are kept."
+                )
+            else:
+                self.log.emit(
+                    f"Note: projected cost has passed your balance (used ~"
+                    f"{self._spent_units:.1f}/{budget:.1f} lead credits) during "
+                    f"enrichment — continuing anyway so you can see every result. "
+                    f"You'll only be charged for whatever you actually select "
+                    f"and confirm."
+                )
 
     # -- Chrome lifecycle ---------------------------------------------------
 
@@ -661,6 +678,18 @@ class ScraperWorker(QThread):
                 break
 
             current_count = len(await page.query_selector_all(CARD_LINK_SELECTOR))
+
+            budget = self.cfg.get("token_budget_leads")
+            if budget is not None:
+                projected = self._spent_units + (current_count * 0.2)
+                if projected >= budget:
+                    self.log.emit(
+                        f"  [{query}] projected floor cost ({projected:.1f}) would "
+                        f"meet/exceed budget ({budget:.1f}) — stopping scroll early "
+                        f"at {current_count} cards"
+                    )
+                    self._stop_requested = True
+                    break
 
             if (scroll_i + 1) % 10 == 0:
                 elapsed = time.time() - loop_start
@@ -813,7 +842,10 @@ class ScraperWorker(QThread):
                     else:
                         self.log.emit(f"  [{card.get('name', '?')}] no website link — skipped")
                     new_cost = 1.0 if card.get("email") else prior_cost
-                    self._add_units_and_maybe_stop(new_cost - prior_cost)
+                    # Enrichment never self-stops on budget — it runs every
+                    # lead to completion. The Confirm & Charge step is what
+                    # actually enforces the budget, at selection time.
+                    self._add_units_and_maybe_stop(new_cost - prior_cost, enforce=False)
                 except Exception as e:
                     self.log.emit(f"  enrichment failed for {card.get('name', '?')}: {e}")
                 finally:
@@ -850,7 +882,12 @@ class ScraperWorker(QThread):
             df = self._dedup(all_results)
             self.log.emit(f"Unique leads after dedup: {len(df)}")
 
-            if self.cfg.get("enable_email_enrichment", False) and not df.empty and not self._stop_requested:
+            if self.cfg.get("enable_email_enrichment", False) and not df.empty and not self._manual_stop_requested:
+                # A budget stop during scraping shouldn't block enrichment —
+                # enrichment re-checks budget itself, per lead, via
+                # _add_units_and_maybe_stop. Only a genuine manual Stop
+                # (already excluded above) should carry through and skip it.
+                self._stop_requested = self._manual_stop_requested
                 deduped_records = df.to_dict("records")
                 enriched_records = await self.enrich_with_emails(context, deduped_records)
                 df = pd.DataFrame(enriched_records, columns=COLUMNS)
@@ -890,6 +927,8 @@ class ScraperWorker(QThread):
 STYLE_SHEET = """
 QMainWindow { background-color: #14161c; }
 QWidget { color: #e6e6e6; font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 13px; }
+QScrollArea { background: transparent; border: none; }
+QScrollArea > QWidget > QWidget { background: transparent; }
 
 QToolBar {
     background-color: #1b1e26;
@@ -1030,6 +1069,7 @@ class MainWindow(QMainWindow):
                             f"{'  (admin)' if self.is_admin else ''}")
         self.resize(1320, 800)
         self.setStyleSheet(STYLE_SHEET)
+        self._centered_once = False
 
         self.worker = None
         self.results_df = pd.DataFrame(columns=COLUMNS)
@@ -1056,6 +1096,22 @@ class MainWindow(QMainWindow):
         self.auto_detect_chrome_settings(silent=True)
         self._enforce_role_restrictions()
         self._update_balance_label()
+
+    # -- Toolbar --------------------------------------------------------------
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._centered_once:
+            self._centered_once = True
+            QTimer.singleShot(0, self._center_on_screen)
+
+    def _center_on_screen(self):
+        from PyQt6.QtGui import QCursor
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen:
+            geo = self.frameGeometry()
+            geo.moveCenter(screen.availableGeometry().center())
+            self.move(geo.topLeft())
 
     # -- Toolbar --------------------------------------------------------------
 
@@ -1119,10 +1175,13 @@ class MainWindow(QMainWindow):
         if self.is_admin:
             self.balance_label.setText("Unlimited (admin)")
         else:
-            bal = self.session.get("tokens_balance", 0.0)
+            bal = self.session.get("available_tokens", self.session.get("tokens_balance", 0.0))
+            paid = self.session.get("tokens_balance", 0.0)
+            free_left = self.session.get("free_tokens_remaining_today", 0.0)
+            breakdown = f"  ({paid:g} paid + {free_left:g} free)" if free_left > 0 else ""
             self.balance_label.setText(
                 f"{bal:g} token{'s' if bal != 1 else ''}  "
-                f"(~{bal * self.leads_per_token:g} weighted leads)"
+                f"(~{bal * self.leads_per_token:g} lead credits){breakdown}"
             )
 
     # -- Central widget: tabs ---------------------------------------------------
@@ -1330,9 +1389,13 @@ class MainWindow(QMainWindow):
 
         self.headless_check = QCheckBox("Run headless (no visible browser)")
         form2.addRow(self.headless_check)
+        if not self.is_admin:
+            self.headless_check.setVisible(False)
 
         self.close_after_check = QCheckBox("Close Chrome && tabs after run")
         form2.addRow(self.close_after_check)
+        if not self.is_admin:
+            self.close_after_check.setVisible(False)
 
         self.chrome_exe_edit = QLineEdit()
         self.chrome_exe_edit.setReadOnly(True)
@@ -1495,8 +1558,8 @@ class MainWindow(QMainWindow):
     # -- Tab: Buy Tokens (user accounts only) --------------------------------
 
     def _build_buy_tokens_tab(self):
-        root = QWidget()
-        outer = QVBoxLayout(root)
+        content = QWidget()
+        outer = QVBoxLayout(content)
         outer.setContentsMargins(18, 18, 18, 18)
         outer.setSpacing(14)
 
@@ -1514,6 +1577,9 @@ class MainWindow(QMainWindow):
             "font-size: 22px; font-weight: 700; color: #4c7cff;"
         )
         left_layout.addWidget(self.buy_balance_label)
+        self.buy_balance_breakdown_label = QLabel("")
+        self.buy_balance_breakdown_label.setStyleSheet("color: #7a8194; font-size: 11px;")
+        left_layout.addWidget(self.buy_balance_breakdown_label)
 
         refresh_row = QHBoxLayout()
         refresh_balance_btn = QPushButton("🔄  Refresh Balance")
@@ -1523,11 +1589,18 @@ class MainWindow(QMainWindow):
         refresh_row.addStretch()
         left_layout.addLayout(refresh_row)
 
+        free_daily = float(self.backend_settings.get("free_daily_tokens", 0.0) or 0.0)
+        free_line = (
+            f"You also get {free_daily:g} free token{'s' if free_daily != 1 else ''} every day, "
+            f"which resets at midnight UTC and doesn't carry over if unused.\n\n"
+            if free_daily > 0 else ""
+        )
         how_it_works = QLabel(
             f"Every scrape spends tokens based on what it actually finds:\n\n"
             f"•  A lead with an email found costs 1 token per {self.leads_per_token:g} leads\n"
             f"•  A lead with only a phone number costs half that\n"
             f"•  A lead with neither a phone nor an email still costs a small amount (0.2 units)\n\n"
+            f"{free_line}"
             f"If your balance runs out partway through a run, the run stops "
             f"itself automatically and keeps whatever it already found."
         )
@@ -1565,10 +1638,105 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(refresh_qr_btn)
 
         row.addWidget(right_group, stretch=1)
+
+        # -- Submit payment proof
+        submit_group = QGroupBox("Submit Payment Proof")
+        submit_layout = QVBoxLayout(submit_group)
+        submit_layout.setSpacing(10)
+
+        submit_form = QFormLayout()
+        submit_form.setContentsMargins(0, 0, 0, 0)
+        submit_form.setSpacing(10)
+
+        image_row = QHBoxLayout()
+        self.payment_image_path_edit = QLineEdit()
+        self.payment_image_path_edit.setReadOnly(True)
+        self.payment_image_path_edit.setPlaceholderText("No file selected")
+        browse_payment_btn = QPushButton("Browse…")
+        browse_payment_btn.setObjectName("secondary")
+        browse_payment_btn.clicked.connect(self._browse_payment_image)
+        image_row.addWidget(self.payment_image_path_edit)
+        image_row.addWidget(browse_payment_btn)
+        submit_form.addRow("Screenshot", image_row)
+
+        self.payment_tokens_spin = QDoubleSpinBox()
+        self.payment_tokens_spin.setRange(0.01, 100000)
+        self.payment_tokens_spin.setDecimals(2)
+        self.payment_tokens_spin.setValue(1.0)
+        submit_form.addRow("Tokens paid for", self.payment_tokens_spin)
+
+        self.payment_note_edit = QLineEdit()
+        self.payment_note_edit.setPlaceholderText("Optional note (e.g. reference number)")
+        submit_form.addRow("Note", self.payment_note_edit)
+
+        submit_layout.addLayout(submit_form)
+
+        submit_payment_btn = QPushButton("📤  Submit Payment Proof")
+        submit_payment_btn.clicked.connect(self._handle_submit_payment_proof)
+        submit_layout.addWidget(submit_payment_btn)
+
+        submit_hint = QLabel(
+            "Upload a screenshot of your payment. The admin gets notified and will "
+            "approve or decline it — approved submissions credit tokens to your account."
+        )
+        submit_hint.setWordWrap(True)
+        submit_hint.setStyleSheet("color: #7a8194; font-size: 11px;")
+        submit_layout.addWidget(submit_hint)
+
+        outer.addWidget(submit_group)
+
+        # -- My submission history
+        history_group = QGroupBox("Your Submissions")
+        history_layout = QVBoxLayout(history_group)
+        history_layout.setSpacing(10)
+
+        history_refresh_row = QHBoxLayout()
+        refresh_submissions_btn = QPushButton("🔄  Refresh")
+        refresh_submissions_btn.setObjectName("secondary")
+        refresh_submissions_btn.clicked.connect(self._refresh_my_submissions)
+        history_refresh_row.addWidget(refresh_submissions_btn)
+        history_refresh_row.addStretch()
+        history_layout.addLayout(history_refresh_row)
+
+        self.my_submissions_table = QTableWidget(0, 5)
+        self.my_submissions_table.setHorizontalHeaderLabels(
+            ["Date", "Tokens Requested", "Status", "Tokens Granted", "Admin Note"]
+        )
+        self.my_submissions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.my_submissions_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        self.my_submissions_table.horizontalHeader().setStretchLastSection(True)
+        self.my_submissions_table.horizontalHeader().setMinimumSectionSize(80)
+
+        pal3 = self.my_submissions_table.palette()
+        pal3.setColor(QPalette.ColorRole.Base, QColor("#20242e"))
+        pal3.setColor(QPalette.ColorRole.AlternateBase, QColor("#1c2027"))
+        self.my_submissions_table.setPalette(pal3)
+        history_layout.addWidget(self.my_submissions_table)
+
+        outer.addWidget(history_group)
         outer.addStretch()
 
         self._load_qr_and_instructions()
-        return root
+        self._refresh_my_submissions()
+
+        self.buy_balance_label.setText(
+            f"{self.session.get('available_tokens', 0.0):g} token"
+            f"{'s' if self.session.get('available_tokens', 0.0) != 1 else ''}  "
+            f"(~{self.session.get('available_tokens', 0.0) * self.leads_per_token:g} lead credits)"
+        )
+        paid = self.session.get('tokens_balance', 0.0)
+        free_left = self.session.get('free_tokens_remaining_today', 0.0)
+        self.buy_balance_breakdown_label.setText(
+            f"({paid:g} paid + {free_left:g} free today)"
+        )
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        return scroll
 
     def _load_qr_and_instructions(self):
         qr_url = self.backend_settings.get("qr_code_url")
@@ -1612,19 +1780,65 @@ class MainWindow(QMainWindow):
         if bal is None:
             self.statusBar().showMessage("Couldn't reach the server to refresh your balance.")
             return
-        self.session["tokens_balance"] = bal
+        self.session["tokens_balance"] = bal.get("tokens_balance", 0.0)
+        self.session["free_tokens_remaining_today"] = bal.get("free_tokens_remaining_today", 0.0)
+        self.session["available_tokens"] = bal.get("available_tokens", 0.0)
         self._update_balance_label()
         self.buy_balance_label.setText(
-            f"{bal:g} token{'s' if bal != 1 else ''}  "
-            f"(~{bal * self.leads_per_token:g} weighted leads)"
+            f"{self.session['available_tokens']:g} token"
+            f"{'s' if self.session['available_tokens'] != 1 else ''}  "
+            f"(~{self.session['available_tokens'] * self.leads_per_token:g} lead credits)"
+        )
+        self.buy_balance_breakdown_label.setText(
+            f"({self.session.get('tokens_balance', 0.0):g} paid + "
+            f"{self.session.get('free_tokens_remaining_today', 0.0):g} free today)"
         )
         self.statusBar().showMessage("Balance refreshed.")
 
+    def _browse_payment_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select payment screenshot", "", "Images (*.png *.jpg *.jpeg)"
+        )
+        if path:
+            self.payment_image_path_edit.setText(path)
+
+    def _handle_submit_payment_proof(self):
+        path = self.payment_image_path_edit.text().strip()
+        if not path:
+            QMessageBox.warning(self, "No image selected", "Choose a screenshot of your payment first.")
+            return
+        tokens = self.payment_tokens_spin.value()
+        note = self.payment_note_edit.text().strip() or None
+        sub, err = submit_payment_proof(self.session.get("token"), path, tokens, note)
+        if err:
+            QMessageBox.critical(self, "Submission failed", err)
+            return
+        self.statusBar().showMessage("Payment proof submitted — awaiting admin review.")
+        self.payment_image_path_edit.clear()
+        self.payment_note_edit.clear()
+        self._refresh_my_submissions()
+
+    def _refresh_my_submissions(self):
+        subs = get_my_payment_submissions(self.session.get("token"))
+        self.my_submissions_table.setRowCount(0)
+        for s in subs:
+            r = self.my_submissions_table.rowCount()
+            self.my_submissions_table.insertRow(r)
+            created = (s.get("created_at") or "")[:10]
+            granted = s.get("tokens_granted")
+            self.my_submissions_table.setItem(r, 0, QTableWidgetItem(created))
+            self.my_submissions_table.setItem(r, 1, QTableWidgetItem(f"{s.get('tokens_requested', 0):g}"))
+            self.my_submissions_table.setItem(r, 2, QTableWidgetItem(s.get("status", "")))
+            self.my_submissions_table.setItem(
+                r, 3, QTableWidgetItem(f"{granted:g}" if granted is not None else "—")
+            )
+            self.my_submissions_table.setItem(r, 4, QTableWidgetItem(s.get("admin_note") or ""))
+        self.my_submissions_table.resizeColumnsToContents()
     # -- Tab: Admin (admin accounts only) ------------------------------------
 
     def _build_admin_tab(self):
-        root = QWidget()
-        outer = QVBoxLayout(root)
+        content = QWidget()
+        outer = QVBoxLayout(content)
         outer.setContentsMargins(18, 18, 18, 18)
         outer.setSpacing(14)
 
@@ -1673,6 +1887,15 @@ class MainWindow(QMainWindow):
         self.leads_per_token_spin.setDecimals(2)
         self.leads_per_token_spin.setValue(self.leads_per_token)
         settings_form.addRow("Leads per token", self.leads_per_token_spin)
+
+        # NEW — free daily tokens
+        self.free_daily_tokens_spin = QDoubleSpinBox()
+        self.free_daily_tokens_spin.setRange(0, 100000)
+        self.free_daily_tokens_spin.setDecimals(2)
+        self.free_daily_tokens_spin.setValue(
+            float(self.backend_settings.get("free_daily_tokens", 0.0) or 0.0)
+        )
+        settings_form.addRow("Free daily tokens (0 = disabled)", self.free_daily_tokens_spin)
 
         self.qr_url_edit = QLineEdit()
         self.qr_url_edit.setPlaceholderText("https://example.com/payment-qr.png")
@@ -1724,9 +1947,92 @@ class MainWindow(QMainWindow):
 
         outer.addWidget(users_group, stretch=1)
 
-        self._refresh_users_table()
-        return root
+        # -- Pending payment submissions
+        submissions_group = QGroupBox("Payment Submissions")
+        submissions_layout = QVBoxLayout(submissions_group)
+        submissions_layout.setSpacing(10)
 
+        submissions_top_row = QHBoxLayout()
+        self.submissions_status_combo = QComboBox()
+        self.submissions_status_combo.addItems(["pending", "approved", "declined", "all"])
+        self.submissions_status_combo.currentTextChanged.connect(self._refresh_pending_submissions)
+        submissions_top_row.addWidget(QLabel("Status:"))
+        submissions_top_row.addWidget(self.submissions_status_combo)
+        refresh_submissions_admin_btn = QPushButton("🔄  Refresh")
+        refresh_submissions_admin_btn.setObjectName("secondary")
+        refresh_submissions_admin_btn.clicked.connect(self._refresh_pending_submissions)
+        submissions_top_row.addWidget(refresh_submissions_admin_btn)
+        submissions_top_row.addStretch()
+        submissions_layout.addLayout(submissions_top_row)
+
+        submissions_split = QHBoxLayout()
+
+        self.submissions_table = QTableWidget(0, 5)
+        self.submissions_table.setHorizontalHeaderLabels(
+            ["ID", "Email", "Tokens Req.", "Note", "Status"]
+        )
+        self.submissions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.submissions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.submissions_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.submissions_table.horizontalHeader().setStretchLastSection(True)
+        pal4 = self.submissions_table.palette()
+        pal4.setColor(QPalette.ColorRole.Base, QColor("#20242e"))
+        pal4.setColor(QPalette.ColorRole.AlternateBase, QColor("#1c2027"))
+        self.submissions_table.setPalette(pal4)
+        self.submissions_table.itemSelectionChanged.connect(self._on_submission_selected)
+        submissions_split.addWidget(self.submissions_table, stretch=2)
+
+        review_panel = QVBoxLayout()
+        self.submission_image_label = QLabel("Select a submission to preview its image.")
+        self.submission_image_label.setWordWrap(True)
+        self.submission_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.submission_image_label.setMinimumSize(260, 260)
+        self.submission_image_label.setStyleSheet(
+            "background-color: #20242e; border: 1px solid #2f3542; "
+            "border-radius: 8px; color: #7a8194;"
+        )
+        review_panel.addWidget(self.submission_image_label)
+
+        review_form = QFormLayout()
+        self.review_tokens_spin = QDoubleSpinBox()
+        self.review_tokens_spin.setRange(0.0, 100000)
+        self.review_tokens_spin.setDecimals(2)
+        review_form.addRow("Tokens to grant", self.review_tokens_spin)
+        self.review_note_edit = QLineEdit()
+        self.review_note_edit.setPlaceholderText("Optional note to the user")
+        review_form.addRow("Admin note", self.review_note_edit)
+        review_panel.addLayout(review_form)
+
+        review_btn_row = QHBoxLayout()
+        approve_btn = QPushButton("✅  Approve")
+        approve_btn.clicked.connect(self._handle_approve_submission)
+        decline_btn = QPushButton("❌  Decline")
+        decline_btn.setObjectName("danger")
+        decline_btn.clicked.connect(self._handle_decline_submission)
+        review_btn_row.addWidget(approve_btn)
+        review_btn_row.addWidget(decline_btn)
+        review_panel.addLayout(review_btn_row)
+        review_panel.addStretch()
+
+        submissions_split.addLayout(review_panel, stretch=1)
+        submissions_layout.addLayout(submissions_split)
+
+        outer.addWidget(submissions_group, stretch=1)
+
+        self._refresh_users_table()
+        self._refresh_pending_submissions()
+
+        self.submissions_poll_timer = QTimer(self)
+        self.submissions_poll_timer.setInterval(15000)  # 15 seconds
+        self.submissions_poll_timer.timeout.connect(self._refresh_pending_submissions)
+        self.submissions_poll_timer.start()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        return scroll
+    
     def _handle_credit_tokens(self):
         email = self.credit_email_edit.text().strip()
         amount = self.credit_amount_spin.value()
@@ -1762,6 +2068,7 @@ class MainWindow(QMainWindow):
             "leads_per_token": self.leads_per_token_spin.value(),
             "qr_code_url": self.qr_url_edit.text().strip() or None,
             "payment_instructions": self.instructions_edit.text().strip() or None,
+            "free_daily_tokens": self.free_daily_tokens_spin.value(),
         }
         try:
             resp = requests.put(
@@ -1776,6 +2083,9 @@ class MainWindow(QMainWindow):
         if resp.status_code == 200:
             self.backend_settings = resp.json()
             self.leads_per_token = float(self.backend_settings.get("leads_per_token", 10.0) or 10.0)
+            self.free_daily_tokens_spin.setValue(                                    # NEW
+                float(self.backend_settings.get("free_daily_tokens", 0.0) or 0.0)    # NEW
+            )
             self.statusBar().showMessage("Settings saved.")
         else:
             try:
@@ -1806,6 +2116,90 @@ class MainWindow(QMainWindow):
             self.users_table.setItem(r, 1, QTableWidgetItem(u["role"]))
             self.users_table.setItem(r, 2, QTableWidgetItem(f"{u['tokens_balance']:g}"))
 
+    def _refresh_pending_submissions(self):
+        status = self.submissions_status_combo.currentText()
+        subs = admin_get_payment_submissions(self.session.get("token"), status)
+        self._pending_submissions = subs
+
+        previously_selected = getattr(self, "_selected_submission_id", None)
+
+        self.submissions_table.setRowCount(0)
+        restore_row = None
+        for i, s in enumerate(subs):
+            r = self.submissions_table.rowCount()
+            self.submissions_table.insertRow(r)
+            self.submissions_table.setItem(r, 0, QTableWidgetItem(str(s["id"])))
+            self.submissions_table.setItem(r, 1, QTableWidgetItem(s["user_email"]))
+            self.submissions_table.setItem(r, 2, QTableWidgetItem(f"{s['tokens_requested']:g}"))
+            self.submissions_table.setItem(r, 3, QTableWidgetItem(s.get("note") or ""))
+            self.submissions_table.setItem(r, 4, QTableWidgetItem(s.get("status", "")))
+            if previously_selected is not None and s["id"] == previously_selected:
+                restore_row = r
+
+        if restore_row is not None:
+            self.submissions_table.blockSignals(True)
+            self.submissions_table.selectRow(restore_row)
+            self.submissions_table.blockSignals(False)
+            # selection persists — image/tokens/note fields untouched too,
+            # since blockSignals prevents itemSelectionChanged from firing
+        else:
+            self.submission_image_label.setText("Select a submission to preview its image.")
+            self.submission_image_label.setPixmap(QPixmap())
+            self._selected_submission_id = None
+
+    def _on_submission_selected(self):
+        rows = self.submissions_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        sub = self._pending_submissions[rows[0].row()]
+        self._selected_submission_id = sub["id"]
+        self.review_tokens_spin.setValue(sub["tokens_requested"])
+        self.review_note_edit.clear()
+
+        img_bytes, mime = admin_get_payment_submission_image(self.session.get("token"), sub["id"])
+        if img_bytes:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(img_bytes):
+                self.submission_image_label.setPixmap(
+                    pixmap.scaled(
+                        260, 260,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                return
+        self.submission_image_label.setText("Couldn't load image.")
+
+    def _handle_approve_submission(self):
+        if not getattr(self, "_selected_submission_id", None):
+            QMessageBox.information(self, "No submission selected", "Select a submission first.")
+            return
+        tokens = self.review_tokens_spin.value()
+        note = self.review_note_edit.text().strip() or None
+        result, err = admin_review_payment_submission(
+            self.session.get("token"), self._selected_submission_id, True, tokens, note
+        )
+        if err:
+            QMessageBox.critical(self, "Approve failed", err)
+            return
+        self.statusBar().showMessage(f"Approved submission #{self._selected_submission_id}.")
+        self._refresh_pending_submissions()
+        self._refresh_users_table()
+
+    def _handle_decline_submission(self):
+        if not getattr(self, "_selected_submission_id", None):
+            QMessageBox.information(self, "No submission selected", "Select a submission first.")
+            return
+        note = self.review_note_edit.text().strip() or None
+        result, err = admin_review_payment_submission(
+            self.session.get("token"), self._selected_submission_id, False, None, note
+        )
+        if err:
+            QMessageBox.critical(self, "Decline failed", err)
+            return
+        self.statusBar().showMessage(f"Declined submission #{self._selected_submission_id}.")
+        self._refresh_pending_submissions()
+
     @staticmethod
     def _label(text):
         lbl = QLabel(text)
@@ -1815,21 +2209,16 @@ class MainWindow(QMainWindow):
     # -- Role restrictions ----------------------------------------------------
 
     def _enforce_role_restrictions(self):
-        """Regular user accounts always run headless and can't change it —
-        only admins get the visible-browser option. Called after every
-        place that could otherwise re-enable/uncheck it (initial load,
-        config load, reset-to-defaults)."""
+        """Regular user accounts always run headless and always close Chrome
+        after each run. Both checkboxes are hidden entirely for non-admin
+        accounts (not just disabled) — there's nothing to show. Called after
+        every place that could otherwise re-enable/uncheck them (initial
+        load, config load, reset-to-defaults)."""
         if not self.is_admin:
             self.headless_check.setChecked(True)
-            self.headless_check.setEnabled(False)
-            self.headless_check.setToolTip(
-                "User accounts always scrape headless. Admins can toggle this."
-            )
-            self.headless_hint.setText(
-                "User accounts always run headless (no visible browser window) "
-                "— this isn't configurable from a regular account. "
-                + self.headless_hint.text()
-            )
+            self.headless_check.setVisible(False)
+            self.close_after_check.setChecked(True)
+            self.close_after_check.setVisible(False)
 
     # -- Query list management -----------------------------------------------
 
@@ -1981,7 +2370,7 @@ class MainWindow(QMainWindow):
         if self.is_admin:
             cfg["token_budget_leads"] = None
         else:
-            bal = self.session.get("tokens_balance", 0.0)
+            bal = self.session.get("available_tokens", self.session.get("tokens_balance", 0.0))
             if bal <= 0:
                 QMessageBox.warning(
                     self, "No tokens left",
@@ -2134,7 +2523,7 @@ class MainWindow(QMainWindow):
             self.confirm_selection_btn.setEnabled(len(checked_rows) > 0)
         else:
             cost = units / self.leads_per_token if self.leads_per_token else 0.0
-            bal = self.session.get("tokens_balance", 0.0)
+            bal = self.session.get("available_tokens", self.session.get("tokens_balance", 0.0))
             over = cost > bal
             color = "#e5484d" if over else "#4c7cff"
             self.selection_cost_label.setText(
@@ -2154,7 +2543,7 @@ class MainWindow(QMainWindow):
 
         if not self.is_admin:
             token_cost = units / self.leads_per_token if self.leads_per_token else 0.0
-            bal = self.session.get("tokens_balance", 0.0)
+            bal = self.session.get("available_tokens", self.session.get("tokens_balance", 0.0))
             if token_cost > bal:
                 QMessageBox.warning(
                     self, "Not enough tokens",
@@ -2164,11 +2553,14 @@ class MainWindow(QMainWindow):
                 return
             new_balance = consume_tokens(self.session.get("token"), token_cost)
             if new_balance is not None:
-                self.session["tokens_balance"] = new_balance
+                self.session["tokens_balance"] = new_balance.get("tokens_balance", 0.0)
+                self.session["free_tokens_remaining_today"] = new_balance.get("free_tokens_remaining_today", 0.0)
+                self.session["available_tokens"] = new_balance.get("available_tokens", 0.0)
                 self._update_balance_label()
                 self.append_log(
                     f"Charged {token_cost:.2f} tokens for {len(kept_df)} selected leads "
-                    f"({units:g} weighted lead-units) — new balance {new_balance:g}."
+                    f"({units:g} weighted lead-units) — new balance "
+                    f"{self.session['available_tokens']:g}."
                 )
             else:
                 self.append_log(
@@ -2199,6 +2591,8 @@ class MainWindow(QMainWindow):
     # -- Cleanup ----------------------------------------------------------------
 
     def closeEvent(self, event):
+        if getattr(self, "submissions_poll_timer", None) is not None:
+            self.submissions_poll_timer.stop()
         if self.worker is not None and self.worker.isRunning():
             self.worker.request_stop()
             self.worker.wait(3000)
@@ -2210,6 +2604,8 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def handle_logout(self):
+        if getattr(self, "submissions_poll_timer", None) is not None:
+            self.submissions_poll_timer.stop()
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.warning(self, "Scrape in progress",
                                  "Stop the current scrape before logging out.")
